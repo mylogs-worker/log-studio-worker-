@@ -1,0 +1,86 @@
+name: Log Studio worker
+
+# Put this file (and cloud_pipeline.py) in the SECOND repository. Repo A's plan job wakes it with
+# repository_dispatch and gives it the odd-numbered chunks. It renders them on its own runner pool,
+# then asks repo A to merge when every chunk of the part is finished.
+run-name: worker ${{ github.event.client_payload.stage }} chunks ${{ github.event.client_payload.chunks }}
+
+on:
+  repository_dispatch:
+    types: [log-studio-render]
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          CH: ${{ github.event.client_payload.chunks }}
+        run: |
+          if ! echo "$CH" | grep -Eq '^[0-9]+(,[0-9]+)*$'; then echo "bad chunk list: $CH"; exit 1; fi
+          echo "matrix=$(jq -cn --arg c "$CH" '{include: ($c | split(",") | map({idx: tonumber}))}')" >> "$GITHUB_OUTPUT"
+
+  render:
+    needs: prep
+    name: render chunk ${{ matrix.idx }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.prep.outputs.matrix) }}
+    steps:
+      - name: Maximize disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          if [ -d /mnt ] && sudo mkdir -p /mnt/work && sudo chown "$USER" /mnt/work; then
+            echo "TMPDIR=/mnt/work" >> "$GITHUB_ENV"        # the big second disk
+          fi
+          df -h / /mnt || true
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install -q numpy google-api-python-client google-auth google-auth-httplib2
+      - name: Render chunk
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}   # Drive account
+          IN_SRC: ${{ github.event.client_payload.source_folder }}
+          STAGE: ${{ github.event.client_payload.stage }}
+          IDX: ${{ matrix.idx }}
+        run: python cloud_pipeline.py render-chunk --source-folder "$IN_SRC" --stage "$STAGE" --idx "$IDX"
+
+  notify:
+    needs: [prep, render]
+    if: ${{ always() && needs.prep.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -q google-api-python-client google-auth google-auth-httplib2
+      - name: Ask repo A to merge when every chunk is in
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}   # Drive account
+          IN_SRC: ${{ github.event.client_payload.source_folder }}
+          STAGE: ${{ github.event.client_payload.stage }}
+          MERGE_REPO: ${{ vars.MAIN_REPO }}          # repo A, e.g. YOURNAME/log-studio
+          MERGE_TOKEN: ${{ secrets.MAIN_PAT }}       # token that may start repo A
+        run: python cloud_pipeline.py check-merge --source-folder "$IN_SRC" --stage "$STAGE"
