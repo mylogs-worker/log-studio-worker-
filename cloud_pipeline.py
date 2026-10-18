@@ -675,13 +675,19 @@ def build_cmd(opts, rate, ch, out, chunk=None, dur=None):
     else:
         fps = LITE_FPS if opts.get("lite") else FPS
         colors = "|".join(WAVE_COLORS[i % len(WAVE_COLORS)] for i in range(ch))
+        # showwaves draws one column per sample slice and needs at least (width x fps) samples per second to
+        # fill the picture. Low-rate audio (8 kHz ADPCM logs) only filled the left half (720p) or third (1080p).
+        # Fix: upsample a copy of the audio for the drawing only; the sound in the video is untouched.
+        need = int(W) * fps
+        vis_rate = 0 if rate >= need * 1.3 else int(math.ceil(need * 2 / 1000) * 1000)
+        pre_wave = f"aresample={vis_rate}," if vis_rate else ""
         if is_gif:
             bg_in = ["-stream_loop", "-1", "-i", bg]
         elif bg:
             bg_in = ["-loop", "1", "-framerate", str(fps), "-i", bg]
         else:
             bg_in = ["-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={fps}"]
-        fc = (f"[0:a]showwaves=s={W}x{H}:mode=cline:rate={fps}:colors={colors},format=rgba[wv];"
+        fc = (f"[0:a]{pre_wave}showwaves=s={W}x{H}:mode=cline:rate={fps}:colors={colors},format=rgba[wv];"
               f"[1:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,format=rgba[bg];"
               f"[bg][wv]overlay=shortest=1:format=auto,format=yuv420p[v]")
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(VIDEO_CRF), "-r", str(fps)]
