@@ -129,7 +129,36 @@ def _creds(refresh_token, scope):
     return c
 
 
+TRANSIENT_HTTP = (429, 500, 502, 503, 504)
+
+
+def _retrying_execute():
+    """Make every plain Google API call survive a dropped connection (ssl.SSLEOFError, resets, 5xx).
+    A 24 minute render must not die because one request hiccuped."""
+    from googleapiclient import http as gh
+    from googleapiclient.errors import HttpError
+    if getattr(gh.HttpRequest, "_ls_patched", False):
+        return
+    orig = gh.HttpRequest.execute
+
+    def execute(self, http=None, num_retries=0):
+        for attempt in range(1, 9):
+            try:
+                return orig(self, http=http, num_retries=num_retries)
+            except HttpError as e:
+                if e.resp.status not in TRANSIENT_HTTP or attempt == 8:
+                    raise
+            except (OSError, EOFError) as e:        # SSLError, ConnectionError, TimeoutError are all OSError
+                if attempt == 8:
+                    raise
+                log(f"Network hiccup ({type(e).__name__}); retry {attempt}/7")
+            time.sleep(min(60, 2 ** attempt))
+    gh.HttpRequest.execute = execute
+    gh.HttpRequest._ls_patched = True
+
+
 def build_services(need_youtube):
+    _retrying_execute()
     from googleapiclient.discovery import build
     drive = build("drive", "v3", cache_discovery=False,
                   credentials=_creds(os.environ["GOOGLE_REFRESH_TOKEN"], SCOPES[1]))
@@ -175,8 +204,15 @@ def download(drive, file_id, dest):
     with open(dest, "wb") as fh:
         dl = MediaIoBaseDownload(fh, req, chunksize=UPLOAD_CHUNK)
         done = False
+        fails = 0
         while not done:
-            _, done = dl.next_chunk(num_retries=5)
+            try:
+                _, done = dl.next_chunk(num_retries=5)
+            except (OSError, EOFError):             # dropped connection: the download resumes where it stopped
+                fails += 1
+                if fails > 8:
+                    raise
+                time.sleep(min(60, 2 ** fails))
 
 
 def resumable_upload(request, label):
@@ -194,8 +230,9 @@ def resumable_upload(request, label):
                 time.sleep(2 ** min(retries, 6))
                 continue
             raise
-        except (ConnectionError, TimeoutError, OSError):
-            if retries < 10:
+        except (ConnectionError, TimeoutError, OSError, EOFError):
+            log(f"{label}: connection dropped, retrying")
+            if retries < 12:
                 retries += 1
                 time.sleep(2 ** min(retries, 6))
                 continue
@@ -1051,6 +1088,8 @@ def cmd_export(a, drive, yt):
         log(f"Rendering {label}: {fmt_time(dur)}")
         feed_ffmpeg(build_cmd(opts, rate, ch, out), master, ranges, ch, "render")
         log(f"Rendered {human_size(os.path.getsize(out))}")
+        if drive:                                        # connections idle during a long render go stale
+            drive, yt = build_services(need_youtube=yt is not None)
         row, bad = deliver(a, drive, yt, ws, out_folder, job_name, kind, out, dur, pi, pn, label, safe, ext, now)
         failed = failed or bad
         if not a.no_upload:
@@ -1151,14 +1190,28 @@ def cmd_render_chunk(a, drive):
     feed_ffmpeg(build_cmd(opts, rate, ch, None, chunk=(str(vpath), str(apath)), dur=dur),
                 master, ranges, ch, f"chunk {a.idx}")
     os.remove(master)                                     # free the big file before uploading
-    for old in _children(drive, folder):                  # a retry replaces its own earlier files
-        if old["name"].startswith(f"c{a.idx:03d}"):
-            drive.files().delete(fileId=old["id"], supportsAllDrives=True).execute()
-    drive_upload(drive, str(apath), folder, apath.name, "audio/flac", public=False)
-    if kind == "video":
-        drive_upload(drive, str(vpath), folder, vpath.name, "video/mp4", public=False)
-    put_json(drive, folder, f"c{a.idx:03d}.done", {"dur": dur, "frames": frames, "rate": rate,
+    drive = build_services(False)[0]                      # the old connection sat idle for the whole render and is dead
+
+    def hand_over(d):                                     # idempotent, so it can simply be run again
+        for old in _children(d, folder):                  # a retry replaces its own earlier files
+            if old["name"].startswith(f"c{a.idx:03d}"):
+                d.files().delete(fileId=old["id"], supportsAllDrives=True).execute()
+        drive_upload(d, str(apath), folder, apath.name, "audio/flac", public=False)
+        if kind == "video":
+            drive_upload(d, str(vpath), folder, vpath.name, "video/mp4", public=False)
+        put_json(d, folder, f"c{a.idx:03d}.done", {"dur": dur, "frames": frames, "rate": rate,
                                                    "made": datetime.now(timezone.utc).isoformat()})
+
+    for attempt in range(1, 5):                           # the render took long: be stubborn about the upload
+        try:
+            hand_over(drive)
+            break
+        except Exception as ex:
+            log(f"Upload attempt {attempt}/4 failed: {type(ex).__name__}: {str(ex)[:200]}")
+            if attempt == 4:
+                raise
+            time.sleep(30 * attempt)
+            drive = build_services(False)[0]              # fresh connection
     log(f"Chunk {a.idx} is in the stage folder.")
 
 
@@ -1228,6 +1281,7 @@ def cmd_merge(a, drive):
     log(f"Joined file: {human_size(os.path.getsize(out))}")
     for f in vlist + alist:
         os.remove(f)
+    drive = build_services(False)[0]                      # fresh connection after the long join
     dur = sum(c["dur"] for c in chunks)
     yt = None
     if kind == "video" and not a.no_youtube:
