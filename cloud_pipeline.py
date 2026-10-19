@@ -19,6 +19,8 @@ Drive layout (created automatically, in the Drive account):
   export : job folder + segment queue -> .ogg / .mp4 parts (one cloud job, short exports)
            -> video: YouTube (default) and optional public Drive copy; audio: Drive
            -> record in the Audio Tree -> wipe runner temp files.
+  gemini-upload : upload chosen audio exports from Drive to the Gemini Files API (kept 48 h) and write the
+           file references to Logger workspace/gemini/, so the page's chat can use them without your phone's data.
   plan / render-chunk / check-merge / merge : the automatic split-parallel system for long parts.
            plan         split one output part into time-safe chunks, hand odd chunks to the worker repo
            render-chunk render one chunk (video without sound + lossless FLAC sound) into stage/
@@ -42,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 AUDIO_EXTS = {".wav", ".wave", ".bwf", ".adpcm", ".au", ".aif", ".aiff", ".flac",
@@ -836,6 +838,17 @@ def get_json(drive, parent, name, kids=None):
     return json.loads(drive.files().get_media(fileId=fid, supportsAllDrives=True).execute())
 
 
+def workspace_or_none(drive, folder_id):
+    """workspace_of, but None when the job folder no longer exists (deleted, or another Google account)."""
+    from googleapiclient.errors import HttpError
+    try:
+        return workspace_of(drive, folder_id)
+    except HttpError as e:
+        if e.resp.status == 404:
+            return None
+        raise
+
+
 def stage_root(drive, ws, create=True):
     if create:
         return get_or_create_folder(drive, "stage", ws)
@@ -882,6 +895,102 @@ def make_chunks(seg_list, vmax_min):
     return [{"idx": i, "segments": [[x / 1000, y / 1000] for x, y in part],
              "dur": sum(y - x for x, y in part) / 1000}
             for i, part in enumerate(split_parts(ms, size))]
+
+
+# ------------------------------------------------------------------ Gemini upload (cloud side, no phone data)
+GEMINI_BASE = os.environ.get("GEMINI_BASE", "https://generativelanguage.googleapis.com")
+GEMINI_MIME = {".ogg": "audio/ogg", ".mp3": "audio/mp3", ".wav": "audio/wav", ".flac": "audio/flac",
+               ".m4a": "audio/aac", ".aac": "audio/aac", ".opus": "audio/ogg"}
+
+
+def _gem_request(url, key, data=None, headers=None, method="POST", timeout=600):
+    h = {"x-goog-api-key": key}
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    last = None
+    for attempt in range(1, 5):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:300]
+            if e.code in TRANSIENT_HTTP and attempt < 4:
+                last = RuntimeError(f"HTTP {e.code}")
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f"Gemini HTTP {e.code}: {body}")
+        except (urllib.error.URLError, OSError) as e:
+            last = e
+            if attempt == 4:
+                break
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"Gemini request failed: {last}")
+
+
+def gemini_upload_file(key, path, display, mime):
+    """Files API, resumable protocol. Returns the file resource {name, uri, mimeType, state}."""
+    size = os.path.getsize(path)
+    r = _gem_request(f"{GEMINI_BASE}/upload/v1beta/files", key,
+                     data=json.dumps({"file": {"display_name": display}}).encode(),
+                     headers={"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+                              "X-Goog-Upload-Header-Content-Length": str(size),
+                              "X-Goog-Upload-Header-Content-Type": mime,
+                              "Content-Type": "application/json"}, timeout=60)
+    upload_url = r.headers.get("x-goog-upload-url")
+    if not upload_url:
+        raise RuntimeError("Gemini did not return an upload URL")
+    with open(path, "rb") as fh:
+        data = fh.read()
+    r = _gem_request(upload_url, key, data=data,
+                     headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0",
+                              "X-Goog-Upload-Command": "upload, finalize"})
+    info = json.loads(r.read())["file"]
+    for _ in range(60):                                   # wait until the file is processed
+        if info.get("state", "ACTIVE") == "ACTIVE":
+            return info
+        if info.get("state") == "FAILED":
+            raise RuntimeError("Gemini could not process " + display)
+        time.sleep(5)
+        info = json.loads(_gem_request(f"{GEMINI_BASE}/v1beta/{info['name']}", key, method="GET",
+                                       timeout=60).read())
+    raise RuntimeError("Gemini took too long to process " + display)
+
+
+def cmd_gemini_upload(a, drive):
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        sys.exit("Missing the GEMINI_API_KEY secret in this repo (Settings > Secrets and variables > Actions).")
+    ids = [x.strip() for x in a.ids.split(",") if x.strip()]
+    if not ids or not a.workspace or not a.req:
+        sys.exit("Missing file ids, workspace or request id.")
+    folder = get_or_create_folder(drive, "gemini", a.workspace)
+    work = Path(a.workdir)
+    files, errors = [], []
+    for i, fid in enumerate(ids, 1):
+        try:
+            meta = drive.files().get(fileId=fid, fields="name,mimeType,size",
+                                     supportsAllDrives=True).execute()
+            name = meta["name"]
+            mime = meta.get("mimeType") or ""
+            if not mime.startswith("audio/"):
+                mime = GEMINI_MIME.get(Path(name).suffix.lower(), "audio/ogg")
+            log(f"{i}/{len(ids)} {name} ({human_size(int(meta.get('size') or 0))})")
+            local = work / f"g{i}{Path(name).suffix}"
+            download(drive, fid, str(local))
+            info = gemini_upload_file(key, str(local), name, mime)
+            os.remove(local)
+            files.append({"display": name, "uri": info["uri"], "mime": info.get("mimeType", mime),
+                          "name": info["name"], "driveId": fid})
+        except Exception as ex:                           # never print the key; messages don't contain it
+            errors.append(f"{fid}: {str(ex)[:200]}")
+            log(f"  failed: {str(ex)[:200]}")
+    now = datetime.now(timezone.utc)
+    put_json(drive, folder, f"gemini_{a.req}.json", {
+        "req": a.req, "created": now.isoformat(),
+        "expires": (now + timedelta(hours=47)).isoformat(),      # Gemini keeps files for 48 hours
+        "files": files, "errors": errors})
+    log(f"Done: {len(files)} file(s) ready for the chat" + (f", {len(errors)} failed" if errors else ""))
+    if not files:
+        sys.exit(1)
 
 
 # ------------------------------------------------------------------ ingest
@@ -983,7 +1092,19 @@ def drive_targets(drive, a, kind):
     return ws, out_folder, job_name
 
 
-def deliver(a, drive, yt, ws, out_folder, job_name, kind, out, dur, pi, pn, label, safe, ext, now):
+def compact_segments(segs):
+    """[[start_s, end_s], ...] with touching pieces joined; None when there are too many to be worth storing."""
+    out = []
+    for x, y in segs:
+        x, y = round(x, 3), round(y, 3)
+        if out and abs(out[-1][1] - x) < 0.002:
+            out[-1][1] = y
+        else:
+            out.append([x, y])
+    return out if 0 < len(out) <= 200 else None
+
+
+def deliver(a, drive, yt, ws, out_folder, job_name, kind, out, dur, pi, pn, label, safe, ext, now, segments=None):
     """Upload one finished part (YouTube and/or Drive), record it in the Audio Tree.
     Returns (row, failed)."""
     stamp_h = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -994,6 +1115,8 @@ def deliver(a, drive, yt, ws, out_folder, job_name, kind, out, dur, pi, pn, labe
              "created": now.isoformat(), "duration": dur}
     if a.group:
         entry.update(group=a.group, part=pi, partTotal=pn)
+    if segments:
+        entry["segments"] = segments                      # which stretches of the log this file contains
     desc = f"Duration {fmt_time(dur)}." + (f" Uploaded {stamp_h}." if a.stamp else "")
     base_title = (a.title or a.prefix) + ("" if pn == 1 else f" (part {pi}/{pn})")
     suffix = f" ({stamp_h})" if a.stamp else ""
@@ -1096,7 +1219,8 @@ def cmd_export(a, drive, yt):
         log(f"Rendered {human_size(os.path.getsize(out))}")
         if drive:                                        # connections idle during a long render go stale
             drive, yt = build_services(need_youtube=yt is not None)
-        row, bad = deliver(a, drive, yt, ws, out_folder, job_name, kind, out, dur, pi, pn, label, safe, ext, now)
+        row, bad = deliver(a, drive, yt, ws, out_folder, job_name, kind, out, dur, pi, pn, label, safe, ext, now,
+                           segments=compact_segments([((x + offset) / rate, (y + offset) / rate) for x, y in ranges]))
         failed = failed or bad
         if not a.no_upload:
             os.remove(out)
@@ -1223,7 +1347,11 @@ def cmd_render_chunk(a, drive):
 
 def cmd_check_merge(a, drive):
     """After every render job: if all chunks are in, wake the merge job (in repo A)."""
-    ws = workspace_of(drive, a.source_folder)
+    ws = workspace_or_none(drive, a.source_folder)
+    if not ws:
+        log("The job folder no longer exists in this Google Drive (deleted, or this repo uses another "
+            "Google account). Nothing to merge.")
+        return
     folder = stage_folder(drive, ws, a.stage, create=False)
     if not folder:
         log("No stage folder: nothing to merge (already finished).")
@@ -1244,7 +1372,10 @@ def cmd_check_merge(a, drive):
 
 
 def cmd_merge(a, drive):
-    ws = workspace_of(drive, a.source_folder)
+    ws = workspace_or_none(drive, a.source_folder)
+    if not ws:
+        log("The job folder no longer exists in this Google Drive (deleted, or another Google account). Nothing to merge.")
+        return
     folder = stage_folder(drive, ws, a.stage, create=False)
     if not folder:
         log("No stage folder: this export was already merged.")
@@ -1295,7 +1426,8 @@ def cmd_merge(a, drive):
     a.no_upload = False
     ws2, out_folder, job_name = drive_targets(drive, a, kind)
     row, failed = deliver(a, drive, yt, ws2, out_folder, job_name, kind, out, dur, pi, pn, label, safe,
-                          ext, datetime.now(timezone.utc))
+                          ext, datetime.now(timezone.utc),
+                          segments=compact_segments([tuple(sg) for c in chunks for sg in c["segments"]]))
     write_summary(kind, [row])
     if failed:
         sys.exit(1)                                       # keep the stage folder so this job can be re-run
@@ -1322,7 +1454,11 @@ def concat_cmd(kind, vlist, alist, out, quality, work):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["ingest", "export", "plan", "render-chunk", "check-merge", "merge"])
+    ap.add_argument("command", choices=["ingest", "export", "plan", "render-chunk", "check-merge", "merge",
+                                        "gemini-upload"])
+    ap.add_argument("--ids", default="", help="gemini-upload: comma separated Drive file IDs")
+    ap.add_argument("--workspace", default="", help="gemini-upload: Logger workspace folder ID")
+    ap.add_argument("--req", default="", help="gemini-upload: request id the page waits for")
     ap.add_argument("--source-folder", help="Drive job folder ID")
     ap.add_argument("--stage", default="", help="split-parallel hand-off folder name")
     ap.add_argument("--idx", type=int, default=0, help="render-chunk: chunk number")
@@ -1363,6 +1499,8 @@ def main():
             cmd_ingest(a, drive)
         elif a.command == "export":
             cmd_export(a, drive, yt)
+        elif a.command == "gemini-upload":
+            cmd_gemini_upload(a, drive)
         elif a.command == "plan":
             cmd_plan(a, drive)
         elif a.command == "render-chunk":
